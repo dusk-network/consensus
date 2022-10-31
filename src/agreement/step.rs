@@ -6,7 +6,7 @@
 
 use crate::agreement::accumulator::Accumulator;
 use crate::commons::{Block, ConsensusError, RoundUpdate};
-use crate::messages::{Header, Message, Status};
+use crate::messages::{Header, Message, Payload, Status};
 use crate::queue::Queue;
 use crate::user::committee::CommitteeSet;
 use crate::user::provisioners::Provisioners;
@@ -15,11 +15,14 @@ use crate::util::pending_queue::PendingQueue;
 use crate::util::pubkey::PublicKey;
 
 use crate::config;
+use std::error;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, Instrument};
+
+use super::verifiers;
 
 const COMMITTEE_SIZE: usize = 64;
 
@@ -115,7 +118,7 @@ impl Executor {
 
         if let Ok(messages) = future_msgs.lock().await.get_events(self.ru.round, 0) {
             for msg in messages {
-                self.collect_agreement(&mut acc, msg).await;
+                self.collect_inbound_msg(&mut acc, msg).await;
             }
         }
 
@@ -136,14 +139,14 @@ impl Executor {
                     if let Ok(msg) = msg {
                          match msg.header.compare_round(self.ru.round) {
                             Status::Future => {
-                                // Future agreement message.
-                                // Keep it for processing when we reach this round.
+                                // Future agreement message. Keep it for a
+                                // deferred processing when we reach this round.
                                 future_msgs
                                     .lock()
                                     .await
                                     .put_event(msg.header.round, 0, msg.clone());
                             }
-                            Status::Present => { self.collect_agreement(&mut acc, msg).await;}
+                            Status::Present => { self.collect_inbound_msg(&mut acc, msg).await;}
                             _ => {}
                         };
                     }
@@ -152,7 +155,7 @@ impl Executor {
         }
     }
 
-    async fn collect_agreement(&mut self, acc: &mut Accumulator, msg: Message) {
+    async fn collect_inbound_msg(&mut self, acc: &mut Accumulator, msg: Message) {
         let hdr = &msg.header;
 
         if !self.is_member(hdr).await {
@@ -164,22 +167,88 @@ impl Executor {
             return;
         }
 
-        // Publish the agreement
+        match msg.payload {
+            Payload::AggrAgreement(_) => {
+                self.collect_aggr_agreement(msg).await;
+            }
+            Payload::Agreement(_) => {
+                // Accumulate the agreement
+                self.collect_agreement(acc, msg).await;
+            }
+            _ => todo!(),
+        }
+    }
+
+    fn collect_votes(&self, _msg: Option<Message>) -> Option<Block> {
+        info!("consensus_achieved");
+        /*
+        // TODO: #1192 - Propagate AggrAgreement
+        // Create new message
+        bits := comm.Bits(*pubs)
+        agAgreement := message.NewAggrAgreement(evs[0], bits, sig)
+        */
+
+        // TODO: Generate winning block. This should be feasible once append-only db is enabled.
+        // generate committee per round, step
+        //  republish, generate_certificate, createWinningBlock
+
+        Some(Block::default())
+    }
+
+    async fn verify_aggr_agreement(&self, msg: &Message) -> Result<(), verifiers::Error> {
+        if let Payload::AggrAgreement(p) = &msg.payload {
+            let hdr = &msg.header;
+
+            _ = verifiers::verify_votes(
+                hdr.block_hash,
+                p.bitset,
+                p.aggr_signature,
+                self.committees_set.clone(),
+                sortition::Config::new(self.ru.seed, hdr.round, hdr.step, 64),
+            )
+            .await?;
+
+            // Verify agreement
+            let m = Message {
+                header: msg.header,
+                payload: Payload::Agreement(p.agreement.clone()),
+                metadata: Default::default(),
+            };
+
+            verifiers::verify_agreement(m, self.committees_set.clone(), self.ru.seed).await?;
+
+            return Ok(());
+        }
+
+        Err(verifiers::Error::VerificationFailed)
+    }
+
+    async fn collect_aggr_agreement(&mut self, msg: Message) -> Option<Block> {
+        if let Err(e) = self.verify_aggr_agreement(&msg).await {
+            error!("failed to verify aggr agreement err: {:?}", e);
+            return None;
+        }
+
+        //TODO:  Create winning block
+
+        // Re-publish the agreement message
+        self.outbound_queue
+            .send(msg)
+            .await
+            .unwrap_or_else(|err| error!("unable to publish a collected agreement msg {:?}", err));
+
+        Some(Block::default())
+    }
+
+    async fn collect_agreement(&mut self, acc: &mut Accumulator, msg: Message) -> Option<Block> {
+        // Re-publish the agreement message
         self.outbound_queue
             .send(msg.clone())
             .await
             .unwrap_or_else(|err| error!("unable to publish a collected agreement msg {:?}", err));
 
         // Accumulate the agreement
-        acc.process(msg.clone()).await;
-    }
-
-    fn collect_votes(&self, _msg: Option<Message>) -> Option<Block> {
-        info!("consensus_achieved");
-
-        // TODO: Generate winning block. This should be feasible once append-only db is enabled.
-        // generate committee per round, step
-        //  republish, generate_certificate, createWinningBlock
+        acc.process(msg).await;
 
         Some(Block::default())
     }
