@@ -4,6 +4,7 @@
 //
 // Copyright (c) DUSK NETWORK. All rights reserved.
 
+use blake3::Hash;
 use consensus::commons::RoundUpdate;
 use consensus::consensus::Consensus;
 use consensus::contract_state::{
@@ -13,7 +14,8 @@ use consensus::user::provisioners::{Provisioners, DUSK};
 use consensus::util::pending_queue::PendingQueue;
 use consensus::util::pubkey::ConsensusPublicKey;
 use dusk_bls12_381_sign::SecretKey;
-use rand::SeedableRng;
+use dusk_wallet::WalletPath;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex};
@@ -27,7 +29,7 @@ pub fn run_main_loop(
     agr_outbound: PendingQueue,
 ) {
     // Initialize N hard-coded provisioners
-    let keys = generate_keys(provisioners_num as u64);
+    let keys = load_provisioners_keys(provisioners_num);
     let provisioners = generate_provisioners_from_keys(keys.clone());
 
     spawn_consensus_in_thread_pool(
@@ -133,16 +135,60 @@ impl Operations for Executor {
     }
 }
 
-fn generate_keys(n: u64) -> Vec<(SecretKey, ConsensusPublicKey)> {
+#[derive(Debug, Clone)]
+struct WalletFile {
+    path: WalletPath,
+    pwd: Hash,
+}
+
+impl dusk_wallet::SecureWalletFile for WalletFile {
+    fn path(&self) -> &WalletPath {
+        &self.path
+    }
+
+    fn pwd(&self) -> Hash {
+        self.pwd
+    }
+}
+
+pub fn load_wallet(
+    path: String,
+    pwd: String,
+) -> Result<
+    (
+        dusk_bls12_381_sign::PublicKey,
+        dusk_bls12_381_sign::SecretKey,
+    ),
+    dusk_wallet::Error,
+> {
+    let file = WalletFile {
+        path: WalletPath::from(PathBuf::from(path)),
+        pwd: blake3::hash(pwd.as_bytes()),
+    };
+
+    let wallet = dusk_wallet::Wallet::from_file(file)
+        .expect("file should be valid wallet file");
+
+    wallet.provisioner_keys(wallet.default_address())
+}
+
+/// Loads wallet files from $DUSK_WALLET_DIR and returns a vector of all loaded consensus keys.
+///
+/// It reads RUSK_WALLET_PWD var to unlock wallet files.
+fn load_provisioners_keys(n: usize) -> Vec<(SecretKey, ConsensusPublicKey)> {
     let mut keys = vec![];
 
+    let dir = std::env::var("DUSK_WALLET_DIR").unwrap();
+    let pwd = std::env::var("RUSK_WALLET_PWD").unwrap();
+
     for i in 0..n {
-        let rng = &mut rand::rngs::StdRng::seed_from_u64(i);
-        let sk = dusk_bls12_381_sign::SecretKey::random(rng);
-        keys.push((
-            sk,
-            ConsensusPublicKey::new(dusk_bls12_381_sign::PublicKey::from(&sk)),
-        ));
+        let mut path = dir.clone();
+        path.push_str(&format!("node_{}.dat", i));
+
+        let (pk, sk) =
+            load_wallet(path, pwd.to_owned()).expect("should be valid file");
+
+        keys.push((sk, ConsensusPublicKey::new(pk)));
     }
 
     keys
@@ -151,10 +197,12 @@ fn generate_keys(n: u64) -> Vec<(SecretKey, ConsensusPublicKey)> {
 fn generate_provisioners_from_keys(
     keys: Vec<(SecretKey, ConsensusPublicKey)>,
 ) -> Provisioners {
+    let minimum_stake = 1000 * DUSK;
+
     let mut p = Provisioners::new();
 
-    for (pos, (_, pk)) in keys.into_iter().enumerate() {
-        p.add_member_with_value(pk, 1000 * (pos as u64) * DUSK);
+    for (_, (_, pk)) in keys.into_iter().enumerate() {
+        p.add_member_with_value(pk, minimum_stake);
     }
 
     p
