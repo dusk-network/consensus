@@ -13,6 +13,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
+          toolchain: nightly
       - uses: actions-rs/cargo@v1
         with:
           command: install
@@ -29,12 +30,15 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
+          toolchain: nightly
           components: clippy
+      - run: rustup component add rustfmt --toolchain nightly-x86_64-unknown-linux-gnu
       - uses: actions-rs/cargo@v1
         with:
+          toolchain: nightly
           command: test
           args: --release
-      - run: rustup component add clippy
+      - run: rustup component add clippy --toolchain nightly-x86_64-unknown-linux-gnu
       - name: "Clippy check release"
         uses: actions-rs/clippy-check@v1
         with:
@@ -49,7 +53,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-      - run: rustup component add rustfmt
+      - run: rustup component add rustfmt 
       - uses: actions-rs/cargo@v1
         with:
           command: fmt
